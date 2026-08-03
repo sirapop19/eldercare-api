@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -19,6 +20,7 @@ type HealthData struct {
 	IsFalling bool    `json:"is_falling"`
 	Lat       float64 `json:"lat"`
 	Lng       float64 `json:"lng"`
+	Timestamp string  `json:"timestamp"`
 }
 
 // 2. โครงสร้างสำหรับประวัติการแจ้งเตือน (ที่แอปมือถือและนาฬิกาใช้อยู่ปัจจุบัน)
@@ -38,7 +40,6 @@ var (
 func main() {
 	app := fiber.New()
 
-	// 🌟 สำคัญมาก: เปิดใช้งาน CORS เพื่อให้แอปมือถือสามารถดึงข้อมูลข้ามโดเมนได้ (กัน Error 104)
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowHeaders: "Origin, Content-Type, Accept",
@@ -66,6 +67,10 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
+		if newData.Timestamp == "" {
+			newData.Timestamp = time.Now().Format(time.RFC3339)
+		}
+
 		mutex.Lock()
 		currentData = newData
 		mutex.Unlock()
@@ -81,7 +86,6 @@ func main() {
 
 	// ==========================================
 	// 📌 ส่วนที่ 3: API สำหรับแอปนาฬิกา & มือถือปัจจุบัน (History)
-	// (ป้องกันไม่ให้แอปที่เขียนไปก่อนหน้านี้ Error Cannot GET)
 	// ==========================================
 	app.Post("/api/alert", func(c *fiber.Ctx) error {
 		var data AlertData
@@ -90,10 +94,8 @@ func main() {
 		}
 
 		mutex.Lock()
-		// นำข้อมูลใหม่ไปต่อไว้หน้าสุดของ List
 		history = append([]AlertData{data}, history...)
 
-		// ป้องกัน Memory เซิร์ฟเวอร์เต็ม (เก็บประวัติแค่ 50 รายการล่าสุด)
 		if len(history) > 50 {
 			history = history[:50]
 		}
@@ -107,11 +109,24 @@ func main() {
 		mutex.Lock()
 		defer mutex.Unlock()
 
-		// ถ้ายังไม่มีประวัติ ให้ส่ง Array เปล่า [] กลับไป (ป้องกันแอปมือถือพัง)
 		if history == nil {
-			history = []AlertData{}
+			return c.JSON([]AlertData{})
 		}
 		return c.JSON(history)
+	})
+
+	app.Get("/api/history/:type", func(c *fiber.Ctx) error {
+		alertType := c.Params("type")
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		var filtered []AlertData
+		for _, item := range history {
+			if item.Type == alertType {
+				filtered = append(filtered, item)
+			}
+		}
+		return c.JSON(filtered)
 	})
 
 	// ==========================================
