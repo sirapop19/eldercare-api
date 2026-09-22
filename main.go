@@ -2,13 +2,16 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -16,6 +19,11 @@ import (
 var db *sql.DB
 
 func initDB() {
+	http.HandleFunc("/api/login", loginHandler)
+	http.HandleFunc("/api/register", registerHandler)
+	http.HandleFunc("/api/social-login", socialLoginHandler)
+	http.HandleFunc("/api/forgot-password", forgotPasswordHandler)
+
 	dsn := "postgresql://postgres.zebevhrnhhrlpfsiqysf:ElderCare2026DB@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 	var err error
 	db, err = sql.Open("postgres", dsn)
@@ -48,7 +56,6 @@ type AlertData struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// 💊 โครงสร้างข้อมูลสำหรับตาราง medicine
 type Medicine struct {
 	ID       int    `json:"id"`
 	Title    string `json:"title"`
@@ -56,13 +63,41 @@ type Medicine struct {
 	IsTaken  bool   `json:"is_taken"`
 }
 
-// 👤 โครงสร้างข้อมูลสำหรับตาราง elderly / caregiver
 type ProfileData struct {
 	Name      string `json:"name"`
 	Age       int    `json:"age"`
 	BloodType string `json:"blood_type"`
 	Diseases  string `json:"diseases"`
 }
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type RegisterRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Name     string `json:"name"`
+}
+
+type SocialLoginRequest struct {
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+}
+
+type ForgotPasswordRequest struct {
+	Email       string `json:"email"`
+	NewPassword string `json:"new_password"`
+}
+
+type Claims struct {
+	Email string `json:"email"`
+	jwt.RegisteredClaims
+}
+
+var jwtKey = []byte("YOUR_SUPER_SECRET_KEY_ELDERCARE")
 
 var (
 	currentData HealthData
@@ -244,7 +279,182 @@ func main() {
 	log.Fatal(app.Listen("0.0.0.0:" + port))
 }
 
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req LoginRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// ค้นหารหัสผ่านที่ถูก Hash ไว้ในฐานข้อมูล
+	var storedPassword string
+	var userName string
+	query := "SELECT name, password FROM users WHERE email = $1"
+	err = db.QueryRow(query, req.Email).Scan(&userName, &storedPassword)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"message": "ไม่พบอีเมลนี้ในระบบ"})
+		return
+	}
+
+	// ตรวจสอบรหัสผ่านที่ส่งมากับค่า Hash ในฐานข้อมูล
+	err = bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(req.Password))
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"message": "รหัสผ่านไม่ถูกต้อง"})
+		return
+	}
+
+	// สร้าง JWT Token มีอายุการใช้งาน 24 ชั่วโมง
+	expirationTime := time.Now().Add(24 * time.Hour)
+	claims := &Claims{
+		Email: req.Email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// ส่ง Token และข้อมูลกลับไปให้แอป Flutter
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "เข้าสู่ระบบสำเร็จ",
+		"token":   tokenString,
+		"name":    userName,
+	})
+}
+
 func HashPassword(password string) (string, error) {
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
 	return string(bytes), err
+}
+
+func registerHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RegisterRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 1. ตรวจสอบว่ามีอีเมลนี้ในระบบหรือยัง
+	var exists bool
+	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)", req.Email).Scan(&exists)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if exists {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"message": "อีเมลนี้ถูกใช้งานแล้ว"})
+		return
+	}
+	//******//
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	query := "INSERT INTO users (email, password, name) VALUES ($1, $2, $3)"
+	_, err = db.Exec(query, req.Email, string(hashedPassword), req.Name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "สมัครสมาชิกสำเร็จ"})
+}
+
+func socialLoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req SocialLoginRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// ตรวจสอบว่ามีอีเมลนี้หรือยัง
+	var userID int
+	var userName string
+	queryCheck := "SELECT id, name FROM users WHERE email = $1"
+	err = db.QueryRow(queryCheck, req.Email).Scan(&userID, &userName)
+
+	if err != nil {
+		// ถ้ายังไม่มี ให้สร้างบัญชีใหม่อัตโนมัติ
+		insertQuery := "INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id"
+		err = db.QueryRow(insertQuery, req.Email, "SOCIAL_LOGIN_"+req.Provider, req.Name).Scan(&userID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		userName = req.Name
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "เข้าสู่ระบบด้วย " + req.Provider + " สำเร็จ",
+		"name":    userName,
+		"user_id": userID,
+	})
+}
+
+func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ForgotPasswordRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// อัปเดตรหัสผ่านใหม่ตามอีเมล
+	query := "UPDATE users SET password = $1 WHERE email = $2"
+	result, err := db.Exec(query, req.NewPassword, req.Email)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"message": "ไม่พบอีเมลนี้ในระบบ"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "เปลี่ยนรหัสผ่านสำเร็จ"})
 }
