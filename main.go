@@ -7,26 +7,26 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var db *sql.DB
 
 func initDB() {
-	dsn := "root:@tcp(127.0.0.1:3306)/eldercare_db?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "postgresql://postgres.zebevhrnhhrlpfsiqysf:ElderCare2026DB@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 	var err error
-	db, err = sql.Open("mysql", dsn)
+	db, err = sql.Open("postgres", dsn)
 	if err != nil {
 		log.Fatalf("❌ เชื่อมต่อฐานข้อมูลล้มเหลว: %v", err)
 	}
 
 	if err = db.Ping(); err != nil {
-		log.Fatalf("❌ ไม่สามารถติดต่อฐานข้อมูล MySQL ได้: %v", err)
+		log.Fatalf("❌ ไม่สามารถติดต่อฐานข้อมูล PostgreSQL ได้: %v", err)
 	}
-	log.Println("✅ เชื่อมต่อฐานข้อมูล MySQL สำเร็จ!")
+	log.Println("✅ เชื่อมต่อฐานข้อมูล PostgreSQL สำเร็จ!")
 }
 
 type HealthData struct {
@@ -84,7 +84,7 @@ func main() {
 	// 📌 ส่วนที่ 1: ตรวจสอบสถานะเซิร์ฟเวอร์
 	// ==========================================
 	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendString("ElderCare API is running successfully with MySQL! 🚀")
+		return c.SendString("ElderCare API is running successfully with PostgreSQL & Supabase! 🚀")
 	})
 
 	// ==========================================
@@ -110,7 +110,8 @@ func main() {
 		currentData = newData
 		mutex.Unlock()
 
-		query := "INSERT INTO health_data (elderly_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp) VALUES (?, ?, ?, ?, ?)"
+		// 🌟 เปลี่ยน ? เป็น $1, $2, $3, $4, $5 สำหรับ PostgreSQL
+		query := "INSERT INTO health_data (elderly_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp) VALUES ($1, $2, $3, $4, $5)"
 		_, err := db.Exec(query, 1, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Health Data ลง DB ไม่สำเร็จ: %v", err)
@@ -139,7 +140,8 @@ func main() {
 			data.Timestamp = time.Now().Format("2006-01-02 15:04:05")
 		}
 
-		query := "INSERT INTO emergency_alert (elderly_id, alert_type, title, heart_rate, alert_timestamp) VALUES (?, ?, ?, ?, ?)"
+		// 🌟 เปลี่ยน ? เป็น $1, $2, $3, $4, $5 สำหรับ PostgreSQL
+		query := "INSERT INTO emergency_alert (elderly_id, alert_type, title, heart_rate, alert_timestamp) VALUES ($1, $2, $3, $4, $5)"
 		_, err := db.Exec(query, 1, data.Type, data.Title, data.HeartRate, data.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Alert ลง DB ไม่สำเร็จ: %v", err)
@@ -172,11 +174,12 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 4: API จัดการรายการยา (Medicine) [เพิ่มใหม่]
+	// 📌 ส่วนที่ 4: API จัดการรายการยา (Medicine)
 	// ==========================================
 	app.Get("/api/medicines/:elderly_id", func(c *fiber.Ctx) error {
 		elderlyID := c.Params("elderly_id")
-		rows, err := db.Query("SELECT id, title, subtitle, is_taken FROM medicine WHERE elderly_id = ?", elderlyID)
+		// 🌟 เปลี่ยน ? เป็น $1
+		rows, err := db.Query("SELECT id, title, subtitle, is_taken FROM medicine WHERE elderly_id = $1", elderlyID)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
@@ -203,7 +206,8 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		query := "INSERT INTO medicine (elderly_id, title, subtitle, is_taken) VALUES (?, ?, ?, ?)"
+		// 🌟 เปลี่ยน ? เป็น $1, $2, $3, $4
+		query := "INSERT INTO medicine (elderly_id, title, subtitle, is_taken) VALUES ($1, $2, $3, $4)"
 		_, err := db.Exec(query, 1, m.Title, m.Subtitle, m.IsTaken)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to save medicine"})
@@ -217,7 +221,8 @@ func main() {
 	// ==========================================
 	app.Delete("/api/medicines/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
-		query := "DELETE FROM medicine WHERE id = ?"
+		// 🌟 เปลี่ยน ? เป็น $1
+		query := "DELETE FROM medicine WHERE id = $1"
 		_, err := db.Exec(query, id)
 		if err != nil {
 			log.Printf("❌ ลบยาออกจาก DB ไม่สำเร็จ: %v", err)

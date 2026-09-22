@@ -4,7 +4,10 @@ go 1.26.5
 
 require github.com/gofiber/fiber/v2 v2.52.14
 
-require filippo.io/edwards25519 v1.2.0 // indirect
+require (
+	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/lib/pq v1.12.3 // indirect
+)
 
 require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
