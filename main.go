@@ -48,13 +48,29 @@ type AlertData struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// 💊 โครงสร้างข้อมูลสำหรับตาราง medicine
+type Medicine struct {
+	ID       int    `json:"id"`
+	Title    string `json:"title"`
+	Subtitle string `json:"subtitle"`
+	IsTaken  bool   `json:"is_taken"`
+}
+
+// 👤 โครงสร้างข้อมูลสำหรับตาราง elderly / caregiver
+type ProfileData struct {
+	Name      string `json:"name"`
+	Age       int    `json:"age"`
+	BloodType string `json:"blood_type"`
+	Diseases  string `json:"diseases"`
+}
+
 var (
 	currentData HealthData
 	mutex       sync.Mutex
 )
 
 func main() {
-	initDB() // 🌟 เริ่มต้นเชื่อมต่อ MySQL
+	initDB()
 	defer db.Close()
 
 	app := fiber.New()
@@ -72,7 +88,7 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 2: API Project (HealthData)
+	// 📌 ส่วนที่ 2: API Project (HealthData & SOS)
 	// ==========================================
 	app.Get("/api/health", func(c *fiber.Ctx) error {
 		mutex.Lock()
@@ -94,8 +110,7 @@ func main() {
 		currentData = newData
 		mutex.Unlock()
 
-		// บันทึกลงตาราง Health_Data ใน MySQL จริง
-		query := "INSERT INTO Health_Data (elderly_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp) VALUES (?, ?, ?, ?, ?)"
+		query := "INSERT INTO health_data (elderly_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp) VALUES (?, ?, ?, ?, ?)"
 		_, err := db.Exec(query, 1, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Health Data ลง DB ไม่สำเร็จ: %v", err)
@@ -112,7 +127,7 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 3: API (History) - ดึงและบันทึกจาก MySQL
+	// 📌 ส่วนที่ 3: API (History & Alert)
 	// ==========================================
 	app.Post("/api/alert", func(c *fiber.Ctx) error {
 		var data AlertData
@@ -124,8 +139,7 @@ func main() {
 			data.Timestamp = time.Now().Format("2006-01-02 15:04:05")
 		}
 
-		// บันทึกลงตาราง Emergency_Alert ใน MySQL จริง
-		query := "INSERT INTO Emergency_Alert (elderly_id, alert_type, title, heart_rate, alert_timestamp) VALUES (?, ?, ?, ?, ?)"
+		query := "INSERT INTO emergency_alert (elderly_id, alert_type, title, heart_rate, alert_timestamp) VALUES (?, ?, ?, ?, ?)"
 		_, err := db.Exec(query, 1, data.Type, data.Title, data.HeartRate, data.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Alert ลง DB ไม่สำเร็จ: %v", err)
@@ -136,7 +150,7 @@ func main() {
 	})
 
 	app.Get("/api/history", func(c *fiber.Ctx) error {
-		rows, err := db.Query("SELECT alert_type, title, heart_rate, alert_timestamp FROM Emergency_Alert ORDER BY alert_id DESC LIMIT 50")
+		rows, err := db.Query("SELECT alert_type, title, heart_rate, alert_timestamp FROM emergency_alert ORDER BY alert_id DESC LIMIT 50")
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
@@ -157,31 +171,64 @@ func main() {
 		return c.JSON(historyList)
 	})
 
-	app.Get("/api/history/:type", func(c *fiber.Ctx) error {
-		alertType := c.Params("type")
-		rows, err := db.Query("SELECT alert_type, title, heart_rate, alert_timestamp FROM Emergency_Alert WHERE alert_type = ? ORDER BY alert_id DESC LIMIT 50", alertType)
+	// ==========================================
+	// 📌 ส่วนที่ 4: API จัดการรายการยา (Medicine) [เพิ่มใหม่]
+	// ==========================================
+	app.Get("/api/medicines/:elderly_id", func(c *fiber.Ctx) error {
+		elderlyID := c.Params("elderly_id")
+		rows, err := db.Query("SELECT id, title, subtitle, is_taken FROM medicine WHERE elderly_id = ?", elderlyID)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
 		defer rows.Close()
 
-		var filtered []AlertData
+		var meds []Medicine
 		for rows.Next() {
-			var item AlertData
-			if err := rows.Scan(&item.Type, &item.Title, &item.HeartRate, &item.Timestamp); err != nil {
+			var m Medicine
+			if err := rows.Scan(&m.ID, &m.Title, &m.Subtitle, &m.IsTaken); err != nil {
 				continue
 			}
-			filtered = append(filtered, item)
+			meds = append(meds, m)
 		}
 
-		if filtered == nil {
-			return c.JSON([]AlertData{})
+		if meds == nil {
+			return c.JSON([]Medicine{})
 		}
-		return c.JSON(filtered)
+		return c.JSON(meds)
+	})
+
+	app.Post("/api/medicines", func(c *fiber.Ctx) error {
+		var m Medicine
+		if err := c.BodyParser(&m); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		query := "INSERT INTO medicine (elderly_id, title, subtitle, is_taken) VALUES (?, ?, ?, ?)"
+		_, err := db.Exec(query, 1, m.Title, m.Subtitle, m.IsTaken)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save medicine"})
+		}
+
+		return c.JSON(fiber.Map{"status": "success", "message": "เพิ่มรายการยาสำเร็จ"})
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 4: ตั้งค่า Port สำหรับ Render.com
+	// 📌 API ลบรายการยา (Medicine Delete)
+	// ==========================================
+	app.Delete("/api/medicines/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		query := "DELETE FROM medicine WHERE id = ?"
+		_, err := db.Exec(query, id)
+		if err != nil {
+			log.Printf("❌ ลบยาออกจาก DB ไม่สำเร็จ: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete medicine"})
+		}
+
+		return c.JSON(fiber.Map{"status": "success", "message": "ลบรายการยาสำเร็จ"})
+	})
+
+	// ==========================================
+	// 📌 ส่วนที่ 5: ตั้งค่า Port สำหรับ Render.com
 	// ==========================================
 	port := os.Getenv("PORT")
 	if port == "" {
