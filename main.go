@@ -2,9 +2,7 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"log"
-	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -19,11 +17,6 @@ import (
 var db *sql.DB
 
 func initDB() {
-	http.HandleFunc("/api/login", loginHandler)
-	http.HandleFunc("/api/register", registerHandler)
-	http.HandleFunc("/api/social-login", socialLoginHandler)
-	http.HandleFunc("/api/forgot-password", forgotPasswordHandler)
-
 	dsn := "postgresql://postgres.zebevhrnhhrlpfsiqysf:ElderCare2026DB@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 	var err error
 	db, err = sql.Open("postgres", dsn)
@@ -61,13 +54,6 @@ type Medicine struct {
 	Title    string `json:"title"`
 	Subtitle string `json:"subtitle"`
 	IsTaken  bool   `json:"is_taken"`
-}
-
-type ProfileData struct {
-	Name      string `json:"name"`
-	Age       int    `json:"age"`
-	BloodType string `json:"blood_type"`
-	Diseases  string `json:"diseases"`
 }
 
 type LoginRequest struct {
@@ -123,7 +109,132 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 2: API Project (HealthData & SOS)
+	// 📌 ส่วนที่ 2: ระบบสมาชิก & ยืนยันตัวตน (Auth API)
+	// ==========================================
+	app.Post("/api/login", func(c *fiber.Ctx) error {
+		var req LoginRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"message": "Invalid input"})
+		}
+
+		var storedPassword string
+		var userName string
+		query := "SELECT name, password FROM users WHERE email = $1"
+		err := db.QueryRow(query, req.Email).Scan(&userName, &storedPassword)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"message": "ไม่พบอีเมลนี้ในระบบ"})
+		}
+
+		err = bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(req.Password))
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"message": "รหัสผ่านไม่ถูกต้อง"})
+		}
+
+		expirationTime := time.Now().Add(24 * time.Hour)
+		claims := &Claims{
+			Email: req.Email,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(expirationTime),
+			},
+		}
+
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, err := token.SignedString(jwtKey)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Could not generate token"})
+		}
+
+		return c.JSON(fiber.Map{
+			"message": "เข้าสู่ระบบสำเร็จ",
+			"token":   tokenString,
+			"name":    userName,
+		})
+	})
+
+	app.Post("/api/register", func(c *fiber.Ctx) error {
+		var req RegisterRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"message": "Invalid input"})
+		}
+
+		var exists bool
+		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)", req.Email).Scan(&exists)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Database error"})
+		}
+
+		if exists {
+			return c.Status(409).JSON(fiber.Map{"message": "อีเมลนี้ถูกใช้งานแล้ว"})
+		}
+
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Server error"})
+		}
+
+		query := "INSERT INTO users (email, password, name) VALUES ($1, $2, $3)"
+		_, err = db.Exec(query, req.Email, string(hashedPassword), req.Name)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Failed to register"})
+		}
+
+		return c.JSON(fiber.Map{"message": "สมัครสมาชิกสำเร็จ"})
+	})
+
+	app.Post("/api/social-login", func(c *fiber.Ctx) error {
+		var req SocialLoginRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"message": "Invalid input"})
+		}
+
+		var userID int
+		var userName string
+		queryCheck := "SELECT id, name FROM users WHERE email = $1"
+		err := db.QueryRow(queryCheck, req.Email).Scan(&userID, &userName)
+
+		if err != nil {
+			insertQuery := "INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id"
+			err = db.QueryRow(insertQuery, req.Email, "SOCIAL_LOGIN_"+req.Provider, req.Name).Scan(&userID)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"message": "Database error"})
+			}
+			userName = req.Name
+		}
+
+		return c.JSON(fiber.Map{
+			"message": "เข้าสู่ระบบด้วย " + req.Provider + " สำเร็จ",
+			"name":    userName,
+			"user_id": userID,
+		})
+	})
+
+	app.Post("/api/forgot-password", func(c *fiber.Ctx) error {
+		var req ForgotPasswordRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"message": "Invalid input"})
+		}
+
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Server error"})
+		}
+
+		query := "UPDATE users SET password = $1 WHERE email = $2"
+		result, err := db.Exec(query, string(hashedPassword), req.Email)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Database error"})
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			return c.Status(404).JSON(fiber.Map{"message": "ไม่พบอีเมลนี้ในระบบ"})
+		}
+
+		return c.JSON(fiber.Map{"message": "เปลี่ยนรหัสผ่านสำเร็จ"})
+	})
+
+	// ==========================================
+	// 📌 ส่วนที่ 3: ข้อมูลสุขภาพ & SOS (HealthData)
 	// ==========================================
 	app.Get("/api/health", func(c *fiber.Ctx) error {
 		mutex.Lock()
@@ -145,7 +256,6 @@ func main() {
 		currentData = newData
 		mutex.Unlock()
 
-		// 🌟 เปลี่ยน ? เป็น $1, $2, $3, $4, $5 สำหรับ PostgreSQL
 		query := "INSERT INTO health_data (elderly_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp) VALUES ($1, $2, $3, $4, $5)"
 		_, err := db.Exec(query, 1, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
 		if err != nil {
@@ -163,7 +273,7 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 3: API (History & Alert)
+	// 📌 ส่วนที่ 4: ประวัติการแจ้งเตือน (Alert & History)
 	// ==========================================
 	app.Post("/api/alert", func(c *fiber.Ctx) error {
 		var data AlertData
@@ -175,14 +285,12 @@ func main() {
 			data.Timestamp = time.Now().Format("2006-01-02 15:04:05")
 		}
 
-		// 🌟 เปลี่ยน ? เป็น $1, $2, $3, $4, $5 สำหรับ PostgreSQL
 		query := "INSERT INTO emergency_alert (elderly_id, alert_type, title, heart_rate, alert_timestamp) VALUES ($1, $2, $3, $4, $5)"
 		_, err := db.Exec(query, 1, data.Type, data.Title, data.HeartRate, data.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Alert ลง DB ไม่สำเร็จ: %v", err)
 		}
 
-		log.Printf("✅ Received & Saved Alert: %+v\n", data)
 		return c.SendStatus(200)
 	})
 
@@ -209,11 +317,10 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 4: API จัดการรายการยา (Medicine)
+	// 📌 ส่วนที่ 5: จัดการรายการยา (Medicine API)
 	// ==========================================
 	app.Get("/api/medicines/:elderly_id", func(c *fiber.Ctx) error {
 		elderlyID := c.Params("elderly_id")
-		// 🌟 เปลี่ยน ? เป็น $1
 		rows, err := db.Query("SELECT id, title, subtitle, is_taken FROM medicine WHERE elderly_id = $1", elderlyID)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
@@ -241,7 +348,6 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		// 🌟 เปลี่ยน ? เป็น $1, $2, $3, $4
 		query := "INSERT INTO medicine (elderly_id, title, subtitle, is_taken) VALUES ($1, $2, $3, $4)"
 		_, err := db.Exec(query, 1, m.Title, m.Subtitle, m.IsTaken)
 		if err != nil {
@@ -251,16 +357,11 @@ func main() {
 		return c.JSON(fiber.Map{"status": "success", "message": "เพิ่มรายการยาสำเร็จ"})
 	})
 
-	// ==========================================
-	// 📌 API ลบรายการยา (Medicine Delete)
-	// ==========================================
 	app.Delete("/api/medicines/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
-		// 🌟 เปลี่ยน ? เป็น $1
 		query := "DELETE FROM medicine WHERE id = $1"
 		_, err := db.Exec(query, id)
 		if err != nil {
-			log.Printf("❌ ลบยาออกจาก DB ไม่สำเร็จ: %v", err)
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete medicine"})
 		}
 
@@ -268,7 +369,7 @@ func main() {
 	})
 
 	// ==========================================
-	// 📌 ส่วนที่ 5: ตั้งค่า Port สำหรับ Render.com
+	// 📌 ส่วนที่ 6: รันเซิร์ฟเวอร์ (Render Port)
 	// ==========================================
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -277,184 +378,4 @@ func main() {
 
 	log.Printf("Server is starting on port %s...", port)
 	log.Fatal(app.Listen("0.0.0.0:" + port))
-}
-
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req LoginRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// ค้นหารหัสผ่านที่ถูก Hash ไว้ในฐานข้อมูล
-	var storedPassword string
-	var userName string
-	query := "SELECT name, password FROM users WHERE email = $1"
-	err = db.QueryRow(query, req.Email).Scan(&userName, &storedPassword)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"message": "ไม่พบอีเมลนี้ในระบบ"})
-		return
-	}
-
-	// ตรวจสอบรหัสผ่านที่ส่งมากับค่า Hash ในฐานข้อมูล
-	err = bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(req.Password))
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"message": "รหัสผ่านไม่ถูกต้อง"})
-		return
-	}
-
-	// สร้าง JWT Token มีอายุการใช้งาน 24 ชั่วโมง
-	expirationTime := time.Now().Add(24 * time.Hour)
-	claims := &Claims{
-		Email: req.Email,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(expirationTime),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(jwtKey)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// ส่ง Token และข้อมูลกลับไปให้แอป Flutter
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "เข้าสู่ระบบสำเร็จ",
-		"token":   tokenString,
-		"name":    userName,
-	})
-}
-
-func HashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
-	return string(bytes), err
-}
-
-func registerHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req RegisterRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// 1. ตรวจสอบว่ามีอีเมลนี้ในระบบหรือยัง
-	var exists bool
-	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)", req.Email).Scan(&exists)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if exists {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]string{"message": "อีเมลนี้ถูกใช้งานแล้ว"})
-		return
-	}
-	//******//
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	query := "INSERT INTO users (email, password, name) VALUES ($1, $2, $3)"
-	_, err = db.Exec(query, req.Email, string(hashedPassword), req.Name)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "สมัครสมาชิกสำเร็จ"})
-}
-
-func socialLoginHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req SocialLoginRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// ตรวจสอบว่ามีอีเมลนี้หรือยัง
-	var userID int
-	var userName string
-	queryCheck := "SELECT id, name FROM users WHERE email = $1"
-	err = db.QueryRow(queryCheck, req.Email).Scan(&userID, &userName)
-
-	if err != nil {
-		// ถ้ายังไม่มี ให้สร้างบัญชีใหม่อัตโนมัติ
-		insertQuery := "INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id"
-		err = db.QueryRow(insertQuery, req.Email, "SOCIAL_LOGIN_"+req.Provider, req.Name).Scan(&userID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		userName = req.Name
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "เข้าสู่ระบบด้วย " + req.Provider + " สำเร็จ",
-		"name":    userName,
-		"user_id": userID,
-	})
-}
-
-func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req ForgotPasswordRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// อัปเดตรหัสผ่านใหม่ตามอีเมล
-	query := "UPDATE users SET password = $1 WHERE email = $2"
-	result, err := db.Exec(query, req.NewPassword, req.Email)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"message": "ไม่พบอีเมลนี้ในระบบ"})
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "เปลี่ยนรหัสผ่านสำเร็จ"})
 }
