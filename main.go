@@ -232,6 +232,28 @@ func main() {
 
 		return c.JSON(fiber.Map{"message": "เปลี่ยนรหัสผ่านสำเร็จ"})
 	})
+	// ==========================================
+	// 📌 ส่วนที่ 2.1: อัปเดตโปรไฟล์ผู้ดูแล
+	// ==========================================
+	app.Put("/api/caregiver/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		var data struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+			Phone string `json:"phone"`
+		}
+		if err := c.BodyParser(&data); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		query := "UPDATE caregivers SET name = $1, email = $2, phone = $3 WHERE id = $4"
+		_, err := db.Exec(query, data.Name, data.Email, data.Phone, id)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
+
+		return c.JSON(fiber.Map{"message": "อัปเดตโปรไฟล์ผู้ดูแลสำเร็จ"})
+	})
 
 	// ==========================================
 	// 📌 ส่วนที่ 3: ข้อมูลสุขภาพ & SOS (HealthData)
