@@ -59,6 +59,19 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมตารางตำแหน่งนาฬิกา: %v", err)
 	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS elderly_profile (
+		elderly_id BIGINT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		age INTEGER NOT NULL DEFAULT 0,
+		blood_type TEXT NOT NULL DEFAULT '',
+		diseases TEXT NOT NULL DEFAULT '',
+		profile_image TEXT NOT NULL DEFAULT '',
+		watch_device_id TEXT NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมตารางโปรไฟล์ผู้สูงอายุ: %v", err)
+	}
 	log.Println("✅ เชื่อมต่อฐานข้อมูล PostgreSQL สำเร็จ!")
 }
 
@@ -107,6 +120,17 @@ type LocationData struct {
 	Latitude   float64 `json:"latitude"`
 	Longitude  float64 `json:"longitude"`
 	RecordedAt string  `json:"recorded_at"`
+}
+
+type ElderlyProfile struct {
+	ElderlyID     int    `json:"elderly_id"`
+	Name          string `json:"name"`
+	Age           int    `json:"age"`
+	BloodType     string `json:"blood_type"`
+	Diseases      string `json:"diseases"`
+	ProfileImage  string `json:"profile_image"`
+	WatchDeviceID string `json:"watch_device_id"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 type LoginRequest struct {
@@ -344,6 +368,61 @@ func main() {
 			"phone":         phone,
 			"profile_image": profileImage,
 		})
+	})
+
+	app.Get("/api/elderly/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		var profile ElderlyProfile
+		err := db.QueryRow(`SELECT elderly_id, name, age, blood_type, diseases,
+			profile_image, watch_device_id, updated_at::text
+			FROM elderly_profile WHERE elderly_id = $1`, id).Scan(
+			&profile.ElderlyID,
+			&profile.Name,
+			&profile.Age,
+			&profile.BloodType,
+			&profile.Diseases,
+			&profile.ProfileImage,
+			&profile.WatchDeviceID,
+			&profile.UpdatedAt,
+		)
+		if err == sql.ErrNoRows {
+			return c.Status(404).JSON(fiber.Map{"error": "Elderly profile not found"})
+		}
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
+		return c.JSON(profile)
+	})
+
+	app.Put("/api/elderly/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		var profile ElderlyProfile
+		if err := c.BodyParser(&profile); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+		_, err := db.Exec(`INSERT INTO elderly_profile (
+			elderly_id, name, age, blood_type, diseases, profile_image, watch_device_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (elderly_id) DO UPDATE SET
+			name = EXCLUDED.name,
+			age = EXCLUDED.age,
+			blood_type = EXCLUDED.blood_type,
+			diseases = EXCLUDED.diseases,
+			profile_image = EXCLUDED.profile_image,
+			watch_device_id = EXCLUDED.watch_device_id,
+			updated_at = NOW()`,
+			id,
+			profile.Name,
+			profile.Age,
+			profile.BloodType,
+			profile.Diseases,
+			profile.ProfileImage,
+			profile.WatchDeviceID,
+		)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save elderly profile"})
+		}
+		return c.JSON(fiber.Map{"message": "บันทึกข้อมูลผู้สูงอายุสำเร็จ"})
 	})
 
 	// ==========================================
