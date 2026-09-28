@@ -27,9 +27,16 @@ func initDB() {
 	if err = db.Ping(); err != nil {
 		log.Fatalf("❌ ไม่สามารถติดต่อฐานข้อมูล PostgreSQL ได้: %v", err)
 	}
-	_, err = db.Exec(`ALTER TABLE careigiver ADD COLUMN IF NOT EXISTS profile_image TEXT`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS caregiver_profile (
+		caregiver_id BIGINT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		email TEXT NOT NULL DEFAULT '',
+		phone TEXT NOT NULL DEFAULT '',
+		profile_image TEXT NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
 	if err != nil {
-		log.Printf("ไม่สามารถเตรียมคอลัมน์รูปโปรไฟล์ผู้ดูแล: %v", err)
+		log.Printf("ไม่สามารถเตรียมตารางโปรไฟล์ผู้ดูแล: %v", err)
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS login_audit (
 		id BIGSERIAL PRIMARY KEY,
@@ -49,6 +56,15 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมเวลาปรับปรุงรายการยา: %v", err)
 	}
+	_, err = db.Exec(`ALTER TABLE health_data ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT ''`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมรหัสอุปกรณ์ข้อมูลสุขภาพ: %v", err)
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS health_data_device_timestamp_idx
+		ON health_data (device_id, record_timestamp DESC)`)
+	if err != nil {
+		log.Printf("ไม่สามารถสร้างดัชนีข้อมูลสุขภาพ: %v", err)
+	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watch_location (
 		id BIGSERIAL PRIMARY KEY,
 		device_id TEXT NOT NULL,
@@ -58,6 +74,11 @@ func initDB() {
 	)`)
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมตารางตำแหน่งนาฬิกา: %v", err)
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS watch_location_device_timestamp_idx
+		ON watch_location (device_id, recorded_at DESC)`)
+	if err != nil {
+		log.Printf("ไม่สามารถสร้างดัชนีตำแหน่งนาฬิกา: %v", err)
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS elderly_profile (
 		elderly_id BIGINT PRIMARY KEY,
@@ -340,8 +361,12 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		query := "UPDATE careigiver SET name = $1, email = $2, phone = $3, profile_image = $4 WHERE id = $5"
-		_, err := db.Exec(query, data.Name, data.Email, data.Phone, data.ProfileImage, id)
+		query := `INSERT INTO caregiver_profile (caregiver_id, name, email, phone, profile_image)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (caregiver_id) DO UPDATE SET
+				name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone,
+				profile_image = EXCLUDED.profile_image, updated_at = NOW()`
+		_, err := db.Exec(query, id, data.Name, data.Email, data.Phone, data.ProfileImage)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
@@ -352,8 +377,12 @@ func main() {
 	app.Get("/api/caregiver/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
 		var name, email, phone, profileImage string
+		if _, err := db.Exec(`INSERT INTO caregiver_profile (caregiver_id) VALUES ($1)
+			ON CONFLICT (caregiver_id) DO NOTHING`, id); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
 		err := db.QueryRow(
-			"SELECT name, email, phone, COALESCE(profile_image, '') FROM careigiver WHERE id = $1",
+			"SELECT name, email, phone, profile_image FROM caregiver_profile WHERE caregiver_id = $1",
 			id,
 		).Scan(&name, &email, &phone, &profileImage)
 		if err == sql.ErrNoRows {
@@ -448,8 +477,9 @@ func main() {
 		currentData = newData
 		mutex.Unlock()
 
-		query := "INSERT INTO health_data (elderly_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp) VALUES ($1, $2, $3, $4, $5)"
-		_, err := db.Exec(query, 1, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
+		query := `INSERT INTO health_data (elderly_id, device_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp)
+			VALUES ($1, $2, $3, $4, $5, $6)`
+		_, err := db.Exec(query, 1, newData.DeviceID, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Health Data ลง DB ไม่สำเร็จ: %v", err)
 		}
@@ -458,9 +488,10 @@ func main() {
 	})
 
 	app.Get("/api/health/history", func(c *fiber.Ctx) error {
-		rows, err := db.Query(`SELECT heart_rate, record_timestamp::text
-			FROM health_data WHERE elderly_id = $1
-			ORDER BY record_timestamp DESC LIMIT 168`, 1)
+		deviceID := c.Query("device_id")
+		rows, err := db.Query(`SELECT COALESCE(device_id, ''), heart_rate, record_timestamp::text
+			FROM health_data WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2)
+			ORDER BY record_timestamp DESC LIMIT 720`, 1, deviceID)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
@@ -469,7 +500,7 @@ func main() {
 		var history []HealthData
 		for rows.Next() {
 			var item HealthData
-			if err := rows.Scan(&item.BPM, &item.Timestamp); err == nil {
+			if err := rows.Scan(&item.DeviceID, &item.BPM, &item.Timestamp); err == nil {
 				history = append(history, item)
 			}
 		}
