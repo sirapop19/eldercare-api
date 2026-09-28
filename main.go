@@ -27,7 +27,7 @@ func initDB() {
 	if err = db.Ping(); err != nil {
 		log.Fatalf("❌ ไม่สามารถติดต่อฐานข้อมูล PostgreSQL ได้: %v", err)
 	}
-	_, err = db.Exec(`ALTER TABLE caregivers ADD COLUMN IF NOT EXISTS profile_image TEXT`)
+	_, err = db.Exec(`ALTER TABLE careigiver ADD COLUMN IF NOT EXISTS profile_image TEXT`)
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมคอลัมน์รูปโปรไฟล์ผู้ดูแล: %v", err)
 	}
@@ -340,7 +340,7 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		query := "UPDATE caregivers SET name = $1, email = $2, phone = $3, profile_image = $4 WHERE id = $5"
+		query := "UPDATE careigiver SET name = $1, email = $2, phone = $3, profile_image = $4 WHERE id = $5"
 		_, err := db.Exec(query, data.Name, data.Email, data.Phone, data.ProfileImage, id)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
@@ -353,7 +353,7 @@ func main() {
 		id := c.Params("id")
 		var name, email, phone, profileImage string
 		err := db.QueryRow(
-			"SELECT name, email, phone, COALESCE(profile_image, '') FROM caregivers WHERE id = $1",
+			"SELECT name, email, phone, COALESCE(profile_image, '') FROM careigiver WHERE id = $1",
 			id,
 		).Scan(&name, &email, &phone, &profileImage)
 		if err == sql.ErrNoRows {
