@@ -80,6 +80,15 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถสร้างดัชนีตำแหน่งนาฬิกา: %v", err)
 	}
+	_, err = db.Exec(`ALTER TABLE emergency_alert ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT ''`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมรหัสอุปกรณ์แจ้งเตือนฉุกเฉิน: %v", err)
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS emergency_alert_device_timestamp_idx
+		ON emergency_alert (device_id, alert_timestamp DESC)`)
+	if err != nil {
+		log.Printf("ไม่สามารถสร้างดัชนีแจ้งเตือนฉุกเฉิน: %v", err)
+	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS elderly_profile (
 		elderly_id BIGINT PRIMARY KEY,
 		name TEXT NOT NULL DEFAULT '',
@@ -110,6 +119,7 @@ type HealthData struct {
 
 type AlertData struct {
 	ID        int    `json:"id"`
+	DeviceID  string `json:"device_id"`
 	Type      string `json:"type"`
 	Title     string `json:"title"`
 	HeartRate int    `json:"heart_rate"`
@@ -559,22 +569,32 @@ func main() {
 		if err := c.BodyParser(&data); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
+		if data.DeviceID == "" || data.Type == "" || data.Title == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "device_id, type and title are required"})
+		}
 
 		if data.Timestamp == "" {
 			data.Timestamp = time.Now().Format("2006-01-02 15:04:05")
 		}
 
-		query := "INSERT INTO emergency_alert (elderly_id, alert_type, title, heart_rate, alert_timestamp) VALUES ($1, $2, $3, $4, $5)"
-		_, err := db.Exec(query, 1, data.Type, data.Title, data.HeartRate, data.Timestamp)
+		query := `INSERT INTO emergency_alert (
+			elderly_id, device_id, alert_type, title, heart_rate, alert_timestamp
+		) VALUES ($1, $2, $3, $4, $5, $6)`
+		_, err := db.Exec(query, 1, data.DeviceID, data.Type, data.Title, data.HeartRate, data.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Alert ลง DB ไม่สำเร็จ: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save alert"})
 		}
 
-		return c.SendStatus(200)
+		return c.Status(201).JSON(fiber.Map{"status": "saved"})
 	})
 
 	app.Get("/api/history", func(c *fiber.Ctx) error {
-		rows, err := db.Query("SELECT alert_id, alert_type, title, heart_rate, alert_timestamp FROM emergency_alert ORDER BY alert_id DESC LIMIT 50")
+		deviceID := c.Query("device_id")
+		rows, err := db.Query(`SELECT alert_id, device_id, alert_type, title, heart_rate, alert_timestamp
+			FROM emergency_alert
+			WHERE ($1 = '' OR device_id = $1)
+			ORDER BY alert_id DESC LIMIT 50`, deviceID)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
@@ -583,7 +603,7 @@ func main() {
 		var historyList []AlertData
 		for rows.Next() {
 			var item AlertData
-			if err := rows.Scan(&item.ID, &item.Type, &item.Title, &item.HeartRate, &item.Timestamp); err != nil {
+			if err := rows.Scan(&item.ID, &item.DeviceID, &item.Type, &item.Title, &item.HeartRate, &item.Timestamp); err != nil {
 				continue
 			}
 			historyList = append(historyList, item)
