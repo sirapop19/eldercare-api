@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -696,6 +697,7 @@ func main() {
 		currentData = newData
 		mutex.Unlock()
 
+		// 1. บันทึกข้อมูลสุขภาพลงตาราง health_data ปกติ
 		query := `INSERT INTO health_data (elderly_id, device_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp)
 			VALUES ($1, $2, $3, $4, $5, $6)`
 		_, err := db.Exec(query, 1, newData.DeviceID, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
@@ -703,14 +705,51 @@ func main() {
 			log.Printf("❌ บันทึก Health Data ลง DB ไม่สำเร็จ: %v", err)
 		}
 
+		// 2. ตรวจสอบเกณฑ์ชีพจร (Custom Min/Max BPM) ของอุปกรณ์นี้
+		if newData.DeviceID != "" && newData.BPM > 0 {
+			var minBpm, maxBpm int
+			err := db.QueryRow(
+				"SELECT COALESCE(custom_min_bpm, 50), COALESCE(custom_max_bpm, 120) FROM smartwatch WHERE device_id = $1",
+				newData.DeviceID,
+			).Scan(&minBpm, &maxBpm)
+
+			if err == nil {
+				var alertType, alertTitle string
+
+				// เช็คกรณีสูงเกินกว่า Max BPM
+				if newData.BPM > maxBpm {
+					alertType = "heart_rate_high"
+					alertTitle = fmt.Sprintf("⚠️️ ชีพจรสูงผิดปกติ: %d BPM (เกินเกณฑ์ >%d)", newData.BPM, maxBpm)
+				} else if newData.BPM < minBpm {
+					// เช็คกรณีต่ำกว่า Min BPM
+					alertType = "heart_rate_low"
+					alertTitle = fmt.Sprintf("⚠️ ชีพจรต่ำผิดปกติ: %d BPM (ต่ำกว่าเกณฑ์ <%d)", newData.BPM, minBpm)
+				}
+
+				// ถ้าอยู่นอกเกณฑ์ ให้บันทึกแจ้งเตือนลงตาราง emergency_alert ทันที
+				if alertType != "" {
+					alertQuery := `INSERT INTO emergency_alert (elderly_id, device_id, alert_type, title, heart_rate, alert_timestamp)
+						VALUES ($1, $2, $3, $4, $5, $6)`
+					_, alertErr := db.Exec(alertQuery, 1, newData.DeviceID, alertType, alertTitle, newData.BPM, newData.Timestamp)
+					if alertErr != nil {
+						log.Printf("❌ สร้างแจ้งเตือนชีพจรผิดปกติไม่สำเร็จ: %v", alertErr)
+					}
+				}
+			}
+		}
+
 		return c.JSON(fiber.Map{"status": "success", "data": currentData})
 	})
 
 	app.Get("/api/health/history", func(c *fiber.Ctx) error {
 		deviceID := c.Query("device_id")
-		rows, err := db.Query(`SELECT COALESCE(device_id, ''), heart_rate, record_timestamp::text
-			FROM health_data WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2)
-			ORDER BY record_timestamp DESC LIMIT 720`, 1, deviceID)
+		rows, err := db.Query(
+			`SELECT COALESCE(device_id, ''), heart_rate, record_timestamp::text 
+     		FROM health_data 
+     		WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2) 
+     		ORDER BY record_timestamp DESC LIMIT 720`,
+			1, deviceID,
+		)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
