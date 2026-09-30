@@ -619,12 +619,13 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		_, err := db.Exec(`UPDATE smartwatch SET 
-        fall_sensitivity = $1, 
-        custom_min_bpm = $2, 
-        custom_max_bpm = $3 
-        WHERE device_id = $4`,
-			s.FallSensitivity, s.CustomMinBpm, s.CustomMaxBpm, deviceID,
+		_, err := db.Exec(`INSERT INTO smartwatch (device_id, fall_sensitivity, custom_min_bpm, custom_max_bpm)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (device_id) DO UPDATE SET 
+				fall_sensitivity = EXCLUDED.fall_sensitivity, 
+				custom_min_bpm = EXCLUDED.custom_min_bpm, 
+				custom_max_bpm = EXCLUDED.custom_max_bpm`,
+			deviceID, s.FallSensitivity, s.CustomMinBpm, s.CustomMaxBpm,
 		)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to update smartwatch settings"})
