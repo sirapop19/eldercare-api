@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,11 +35,16 @@ func initDB() {
 		name TEXT NOT NULL DEFAULT '',
 		email TEXT NOT NULL DEFAULT '',
 		phone TEXT NOT NULL DEFAULT '',
+		relationship TEXT NOT NULL DEFAULT '',
 		profile_image TEXT NOT NULL DEFAULT '',
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมตารางโปรไฟล์ผู้ดูแล: %v", err)
+	}
+	_, err = db.Exec(`ALTER TABLE caregiver_profile ADD COLUMN IF NOT EXISTS relationship TEXT NOT NULL DEFAULT ''`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมความสัมพันธ์ผู้ดูแล: %v", err)
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS login_audit (
 		id BIGSERIAL PRIMARY KEY,
@@ -84,6 +92,10 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมรหัสอุปกรณ์แจ้งเตือนฉุกเฉิน: %v", err)
 	}
+	_, err = db.Exec(`ALTER TABLE emergency_alert ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมสถานะรับทราบแจ้งเตือนฉุกเฉิน: %v", err)
+	}
 	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS emergency_alert_device_timestamp_idx
 		ON emergency_alert (device_id, alert_timestamp DESC)`)
 	if err != nil {
@@ -102,6 +114,25 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมตารางโปรไฟล์ผู้สูงอายุ: %v", err)
 	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS device_settings (
+		device_id TEXT PRIMARY KEY,
+		fall_sensitivity TEXT NOT NULL DEFAULT 'ปานกลาง (แนะนำ)',
+		wifi_ssid TEXT NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมตารางการตั้งค่าอุปกรณ์: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS care_record (
+		caregiver_id BIGINT NOT NULL,
+		elderly_id BIGINT NOT NULL,
+		start_date DATE,
+		work_shift TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (caregiver_id, elderly_id)
+	)`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมตารางข้อมูลการดูแล: %v", err)
+	}
 	log.Println("✅ เชื่อมต่อฐานข้อมูล PostgreSQL สำเร็จ!")
 }
 
@@ -118,12 +149,13 @@ type HealthData struct {
 }
 
 type AlertData struct {
-	ID        int    `json:"id"`
-	DeviceID  string `json:"device_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	HeartRate int    `json:"heart_rate"`
-	Timestamp string `json:"timestamp"`
+	ID           int    `json:"id"`
+	DeviceID     string `json:"device_id"`
+	Type         string `json:"type"`
+	Title        string `json:"title"`
+	HeartRate    int    `json:"heart_rate"`
+	Timestamp    string `json:"timestamp"`
+	Acknowledged bool   `json:"acknowledged"`
 }
 
 func recordLogin(email string, provider string, success bool) {
@@ -161,7 +193,32 @@ type ElderlyProfile struct {
 	Diseases      string `json:"diseases"`
 	ProfileImage  string `json:"profile_image"`
 	WatchDeviceID string `json:"watch_device_id"`
+	CustomMinBpm  int    `json:"custom_min_bpm"`
+	CustomMaxBpm  int    `json:"custom_max_bpm"`
 	UpdatedAt     string `json:"updated_at"`
+}
+
+type DeviceSettings struct {
+	DeviceID        string `json:"device_id"`
+	FallSensitivity string `json:"fall_sensitivity"`
+	WifiSSID        string `json:"wifi_ssid"`
+	CustomMinBpm    int    `json:"custom_min_bpm"`
+	CustomMaxBpm    int    `json:"custom_max_bpm"`
+}
+
+type SmartwatchSettings struct {
+	DeviceID        string `json:"device_id"`
+	FallSensitivity string `json:"fall_sensitivity"`
+	CustomMinBpm    int    `json:"custom_min_bpm"`
+	CustomMaxBpm    int    `json:"custom_max_bpm"`
+	Status          string `json:"status"`
+}
+
+type CareRecord struct {
+	CaregiverID int    `json:"caregiver_id"`
+	ElderlyID   int    `json:"elderly_id"`
+	StartDate   string `json:"start_date"`
+	WorkShift   string `json:"work_shift"`
 }
 
 type LoginRequest struct {
@@ -184,6 +241,16 @@ type SocialLoginRequest struct {
 type ForgotPasswordRequest struct {
 	Email       string `json:"email"`
 	NewPassword string `json:"new_password"`
+	ResetToken  string `json:"reset_token"`
+}
+
+type VerifyResetEmailRequest struct {
+	Email string `json:"email"`
+}
+
+type passwordResetToken struct {
+	Email     string
+	ExpiresAt time.Time
 }
 
 type Claims struct {
@@ -194,9 +261,26 @@ type Claims struct {
 var jwtKey = []byte("YOUR_SUPER_SECRET_KEY_ELDERCARE")
 
 var (
-	currentData HealthData
-	mutex       sync.Mutex
+	currentData         HealthData
+	mutex               sync.Mutex
+	passwordResetTokens = make(map[string]passwordResetToken)
+	resetTokenMutex     sync.Mutex
 )
+
+func createPasswordResetToken(email string) (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(bytes)
+	resetTokenMutex.Lock()
+	passwordResetTokens[token] = passwordResetToken{
+		Email:     email,
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+	}
+	resetTokenMutex.Unlock()
+	return token, nil
+}
 
 func main() {
 	initDB()
@@ -332,10 +416,41 @@ func main() {
 		})
 	})
 
+	app.Post("/api/forgot-password/verify-email", func(c *fiber.Ctx) error {
+		var req VerifyResetEmailRequest
+		if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.Email) == "" {
+			return c.Status(400).JSON(fiber.Map{"message": "กรุณากรอกอีเมล"})
+		}
+
+		var exists bool
+		if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)", strings.TrimSpace(req.Email)).Scan(&exists); err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "Database error"})
+		}
+		if !exists {
+			return c.Status(404).JSON(fiber.Map{"message": "ไม่พบอีเมลนี้ในระบบ"})
+		}
+
+		token, err := createPasswordResetToken(strings.TrimSpace(req.Email))
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"message": "ไม่สามารถสร้างคำขอเปลี่ยนรหัสผ่าน"})
+		}
+		return c.JSON(fiber.Map{"reset_token": token})
+	})
+
 	app.Post("/api/forgot-password", func(c *fiber.Ctx) error {
 		var req ForgotPasswordRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"message": "Invalid input"})
+		}
+		if strings.TrimSpace(req.Email) == "" || req.NewPassword == "" || req.ResetToken == "" {
+			return c.Status(400).JSON(fiber.Map{"message": "กรุณายืนยันอีเมลก่อนเปลี่ยนรหัสผ่าน"})
+		}
+		resetTokenMutex.Lock()
+		reset, found := passwordResetTokens[req.ResetToken]
+		validReset := found && reset.Email == strings.TrimSpace(req.Email) && time.Now().Before(reset.ExpiresAt)
+		resetTokenMutex.Unlock()
+		if !validReset {
+			return c.Status(403).JSON(fiber.Map{"message": "การยืนยันอีเมลหมดอายุหรือไม่ถูกต้อง"})
 		}
 
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
@@ -353,6 +468,9 @@ func main() {
 		if rowsAffected == 0 {
 			return c.Status(404).JSON(fiber.Map{"message": "ไม่พบอีเมลนี้ในระบบ"})
 		}
+		resetTokenMutex.Lock()
+		delete(passwordResetTokens, req.ResetToken)
+		resetTokenMutex.Unlock()
 
 		return c.JSON(fiber.Map{"message": "เปลี่ยนรหัสผ่านสำเร็จ"})
 	})
@@ -365,18 +483,19 @@ func main() {
 			Name         string `json:"name"`
 			Email        string `json:"email"`
 			Phone        string `json:"phone"`
+			Relationship string `json:"relationship"`
 			ProfileImage string `json:"profile_image"`
 		}
 		if err := c.BodyParser(&data); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		query := `INSERT INTO caregiver_profile (caregiver_id, name, email, phone, profile_image)
-			VALUES ($1, $2, $3, $4, $5)
+		query := `INSERT INTO caregiver_profile (caregiver_id, name, email, phone, relationship, profile_image)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (caregiver_id) DO UPDATE SET
 				name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone,
-				profile_image = EXCLUDED.profile_image, updated_at = NOW()`
-		_, err := db.Exec(query, id, data.Name, data.Email, data.Phone, data.ProfileImage)
+				relationship = EXCLUDED.relationship, profile_image = EXCLUDED.profile_image, updated_at = NOW()`
+		_, err := db.Exec(query, id, data.Name, data.Email, data.Phone, data.Relationship, data.ProfileImage)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
@@ -386,15 +505,15 @@ func main() {
 
 	app.Get("/api/caregiver/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
-		var name, email, phone, profileImage string
+		var name, email, phone, relationship, profileImage string
 		if _, err := db.Exec(`INSERT INTO caregiver_profile (caregiver_id) VALUES ($1)
 			ON CONFLICT (caregiver_id) DO NOTHING`, id); err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
 		err := db.QueryRow(
-			"SELECT name, email, phone, profile_image FROM caregiver_profile WHERE caregiver_id = $1",
+			"SELECT name, email, phone, relationship, profile_image FROM caregiver_profile WHERE caregiver_id = $1",
 			id,
-		).Scan(&name, &email, &phone, &profileImage)
+		).Scan(&name, &email, &phone, &relationship, &profileImage)
 		if err == sql.ErrNoRows {
 			return c.Status(404).JSON(fiber.Map{"error": "Caregiver not found"})
 		}
@@ -405,6 +524,7 @@ func main() {
 			"name":          name,
 			"email":         email,
 			"phone":         phone,
+			"relationship":  relationship,
 			"profile_image": profileImage,
 		})
 	})
@@ -413,7 +533,7 @@ func main() {
 		id := c.Params("id")
 		var profile ElderlyProfile
 		err := db.QueryRow(`SELECT elderly_id, name, age, blood_type, diseases,
-			profile_image, watch_device_id, updated_at::text
+			profile_image, watch_device_id, COALESCE(custom_min_bpm, 50), COALESCE(custom_max_bpm, 120), updated_at::text
 			FROM elderly_profile WHERE elderly_id = $1`, id).Scan(
 			&profile.ElderlyID,
 			&profile.Name,
@@ -422,6 +542,8 @@ func main() {
 			&profile.Diseases,
 			&profile.ProfileImage,
 			&profile.WatchDeviceID,
+			&profile.CustomMinBpm,
+			&profile.CustomMaxBpm,
 			&profile.UpdatedAt,
 		)
 		if err == sql.ErrNoRows {
@@ -440,8 +562,8 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 		_, err := db.Exec(`INSERT INTO elderly_profile (
-			elderly_id, name, age, blood_type, diseases, profile_image, watch_device_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			elderly_id, name, age, blood_type, diseases, profile_image, watch_device_id, custom_min_bpm, custom_max_bpm
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (elderly_id) DO UPDATE SET
 			name = EXCLUDED.name,
 			age = EXCLUDED.age,
@@ -449,6 +571,8 @@ func main() {
 			diseases = EXCLUDED.diseases,
 			profile_image = EXCLUDED.profile_image,
 			watch_device_id = EXCLUDED.watch_device_id,
+			custom_min_bpm = EXCLUDED.custom_min_bpm,
+			custom_max_bpm = EXCLUDED.custom_max_bpm,
 			updated_at = NOW()`,
 			id,
 			profile.Name,
@@ -457,11 +581,95 @@ func main() {
 			profile.Diseases,
 			profile.ProfileImage,
 			profile.WatchDeviceID,
+			profile.CustomMinBpm,
+			profile.CustomMaxBpm,
 		)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to save elderly profile"})
 		}
 		return c.JSON(fiber.Map{"message": "บันทึกข้อมูลผู้สูงอายุสำเร็จ"})
+	})
+
+	// ==========================================
+	// 📌 ส่วนที่ 2.2: การตั้งค่าอุปกรณ์นาฬิกา (Device Settings)
+	// ==========================================
+	app.Get("/api/device-settings/:device_id", func(c *fiber.Ctx) error {
+		deviceID := c.Params("device_id")
+		var s SmartwatchSettings
+		s.DeviceID = deviceID
+		s.FallSensitivity = "ปานกลาง (แนะนำ)"
+		s.CustomMinBpm = 50
+		s.CustomMaxBpm = 120
+
+		err := db.QueryRow(
+			"SELECT COALESCE(fall_sensitivity, 'ปานกลาง (แนะนำ)'), COALESCE(custom_min_bpm, 50), COALESCE(custom_max_bpm, 120), COALESCE(status, '') FROM smartwatch WHERE device_id = $1",
+			deviceID,
+		).Scan(&s.FallSensitivity, &s.CustomMinBpm, &s.CustomMaxBpm, &s.Status)
+
+		if err != nil && err != sql.ErrNoRows {
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
+		return c.JSON(s)
+	})
+
+	app.Put("/api/device-settings/:device_id", func(c *fiber.Ctx) error {
+		deviceID := c.Params("device_id")
+		var s SmartwatchSettings
+		if err := c.BodyParser(&s); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		_, err := db.Exec(`UPDATE smartwatch SET 
+        fall_sensitivity = $1, 
+        custom_min_bpm = $2, 
+        custom_max_bpm = $3 
+        WHERE device_id = $4`,
+			s.FallSensitivity, s.CustomMinBpm, s.CustomMaxBpm, deviceID,
+		)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to update smartwatch settings"})
+		}
+		return c.JSON(fiber.Map{"message": "บันทึกการตั้งค่าอุปกรณ์สำเร็จ"})
+	})
+
+	// ==========================================
+	// 📌 ส่วนที่ 2.3: ข้อมูลการดูแล (Care Record)
+	// ==========================================
+	app.Get("/api/care-record/:elderly_id", func(c *fiber.Ctx) error {
+		elderlyID := c.Params("elderly_id")
+		var record CareRecord
+		var startDate sql.NullString
+		err := db.QueryRow(
+			`SELECT caregiver_id, elderly_id, start_date::text, work_shift
+				FROM care_record WHERE elderly_id = $1 ORDER BY caregiver_id LIMIT 1`,
+			elderlyID,
+		).Scan(&record.CaregiverID, &record.ElderlyID, &startDate, &record.WorkShift)
+		if err == sql.ErrNoRows {
+			return c.Status(404).JSON(fiber.Map{"error": "Care record not found"})
+		}
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
+		record.StartDate = startDate.String
+		return c.JSON(record)
+	})
+
+	app.Put("/api/care-record", func(c *fiber.Ctx) error {
+		var record CareRecord
+		if err := c.BodyParser(&record); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+		_, err := db.Exec(`INSERT INTO care_record (caregiver_id, elderly_id, start_date, work_shift)
+			VALUES ($1, $2, NULLIF($3, '')::date, $4)
+			ON CONFLICT (caregiver_id, elderly_id) DO UPDATE SET
+				start_date = EXCLUDED.start_date,
+				work_shift = EXCLUDED.work_shift`,
+			record.CaregiverID, record.ElderlyID, record.StartDate, record.WorkShift,
+		)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save care record"})
+		}
+		return c.JSON(fiber.Map{"message": "บันทึกข้อมูลการดูแลสำเร็จ"})
 	})
 
 	// ==========================================
@@ -591,7 +799,8 @@ func main() {
 
 	app.Get("/api/history", func(c *fiber.Ctx) error {
 		deviceID := c.Query("device_id")
-		rows, err := db.Query(`SELECT alert_id, device_id, alert_type, title, heart_rate, alert_timestamp
+		rows, err := db.Query(`SELECT alert_id, device_id, alert_type, title, heart_rate, alert_timestamp,
+			acknowledged_at IS NOT NULL
 			FROM emergency_alert
 			WHERE ($1 = '' OR device_id = $1)
 			ORDER BY alert_id DESC LIMIT 50`, deviceID)
@@ -603,7 +812,7 @@ func main() {
 		var historyList []AlertData
 		for rows.Next() {
 			var item AlertData
-			if err := rows.Scan(&item.ID, &item.DeviceID, &item.Type, &item.Title, &item.HeartRate, &item.Timestamp); err != nil {
+			if err := rows.Scan(&item.ID, &item.DeviceID, &item.Type, &item.Title, &item.HeartRate, &item.Timestamp, &item.Acknowledged); err != nil {
 				continue
 			}
 			historyList = append(historyList, item)
@@ -613,6 +822,20 @@ func main() {
 			return c.JSON([]AlertData{})
 		}
 		return c.JSON(historyList)
+	})
+
+	app.Post("/api/history/:id/acknowledge", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		result, err := db.Exec(`UPDATE emergency_alert
+			SET acknowledged_at = COALESCE(acknowledged_at, NOW()) WHERE alert_id = $1`, id)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
+		updated, _ := result.RowsAffected()
+		if updated == 0 {
+			return c.Status(404).JSON(fiber.Map{"error": "Alert not found"})
+		}
+		return c.JSON(fiber.Map{"status": "acknowledged"})
 	})
 
 	app.Delete("/api/history/:id", func(c *fiber.Ctx) error {
