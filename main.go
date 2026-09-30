@@ -598,11 +598,11 @@ func main() {
 		var s SmartwatchSettings
 		s.DeviceID = deviceID
 		s.FallSensitivity = "ปานกลาง (แนะนำ)"
-		s.CustomMinBpm = 50
-		s.CustomMaxBpm = 120
+		s.CustomMinBpm = 60
+		s.CustomMaxBpm = 100
 
 		err := db.QueryRow(
-			"SELECT COALESCE(fall_sensitivity, 'ปานกลาง (แนะนำ)'), COALESCE(custom_min_bpm, 50), COALESCE(custom_max_bpm, 120), COALESCE(status, '') FROM smartwatch WHERE device_id = $1",
+			"SELECT COALESCE(fall_sensitivity, 'ปานกลาง (แนะนำ)'), COALESCE(custom_min_bpm, 60), COALESCE(custom_max_bpm, 100), COALESCE(status, '') FROM smartwatch WHERE device_id = $1",
 			deviceID,
 		).Scan(&s.FallSensitivity, &s.CustomMinBpm, &s.CustomMaxBpm, &s.Status)
 
