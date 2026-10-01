@@ -121,11 +121,13 @@ func initDB() {
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS device_settings (
 		device_id TEXT PRIMARY KEY,
 		fall_sensitivity TEXT NOT NULL DEFAULT 'ปานกลาง (แนะนำ)',
-		wifi_ssid TEXT NOT NULL DEFAULT '',
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมตารางการตั้งค่าอุปกรณ์: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE device_settings DROP COLUMN IF EXISTS wifi_ssid`); err != nil {
+		log.Printf("ไม่สามารถลบคอลัมน์ Wi-Fi จาก device_settings: %v", err)
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS care_record (
 		id BIGSERIAL PRIMARY KEY,
@@ -174,7 +176,6 @@ type HealthData struct {
 
 type ManualHealthData struct {
 	BPM       int    `json:"bpm"`
-	BP        string `json:"bp"`
 	Timestamp string `json:"timestamp"`
 }
 
@@ -271,14 +272,6 @@ type ElderlyProfile struct {
 	CustomMinBpm  int    `json:"custom_min_bpm"`
 	CustomMaxBpm  int    `json:"custom_max_bpm"`
 	UpdatedAt     string `json:"updated_at"`
-}
-
-type DeviceSettings struct {
-	DeviceID        string `json:"device_id"`
-	FallSensitivity string `json:"fall_sensitivity"`
-	WifiSSID        string `json:"wifi_ssid"`
-	CustomMinBpm    int    `json:"custom_min_bpm"`
-	CustomMaxBpm    int    `json:"custom_max_bpm"`
 }
 
 type SmartwatchSettings struct {
@@ -884,7 +877,6 @@ func main() {
 			}
 			item.Source = "manual"
 			item.BPM = reading.BPM
-			item.BP = reading.BP
 			item.Timestamp = recordedAt.UTC().Format(time.RFC3339Nano)
 			samples = append(samples, timedHealthSample{data: item, recordedAt: recordedAt})
 		}
