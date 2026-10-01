@@ -782,9 +782,9 @@ func main() {
 		mutex.Unlock()
 
 		// 1. บันทึกข้อมูลสุขภาพลงตาราง health_data ปกติ
-		query := `INSERT INTO health_data (elderly_id, device_id, heart_rate, blood_oxygen, blood_pressure, record_timestamp)
-			VALUES ($1, $2, $3, $4, $5, $6)`
-		_, err := db.Exec(query, 1, newData.DeviceID, newData.BPM, newData.SpO2, newData.BP, newData.Timestamp)
+		query := `INSERT INTO health_data (elderly_id, device_id, heart_rate, record_timestamp)
+			VALUES ($1, $2, $3, $4)`
+		_, err := db.Exec(query, 1, newData.DeviceID, newData.BPM, newData.Timestamp)
 		if err != nil {
 			log.Printf("❌ บันทึก Health Data ลง DB ไม่สำเร็จ: %v", err)
 		}
@@ -832,8 +832,7 @@ func main() {
 		}
 		samples := make([]timedHealthSample, 0)
 		watchRows, err := db.Query(
-			`SELECT COALESCE(device_id, ''), heart_rate,
-				COALESCE(blood_pressure, ''), record_timestamp
+			`SELECT COALESCE(device_id, ''), heart_rate, record_timestamp
 			 FROM health_data
 			 WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2)
 			 ORDER BY record_timestamp DESC LIMIT 720`,
@@ -845,7 +844,7 @@ func main() {
 			for watchRows.Next() {
 				var item HealthData
 				var recordedAt time.Time
-				if err := watchRows.Scan(&item.DeviceID, &item.BPM, &item.BP, &recordedAt); err != nil {
+				if err := watchRows.Scan(&item.DeviceID, &item.BPM, &recordedAt); err != nil {
 					log.Printf("ข้ามรายการสุขภาพจากนาฬิกาที่อ่านไม่ได้: %v", err)
 					continue
 				}
