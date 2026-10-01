@@ -841,26 +841,23 @@ func main() {
 		)
 		if err != nil {
 			log.Printf("อ่านประวัติสุขภาพจากนาฬิกาไม่สำเร็จ: %v", err)
-			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
-		}
-		for watchRows.Next() {
-			var item HealthData
-			var recordedAt time.Time
-			if err := watchRows.Scan(&item.DeviceID, &item.BPM, &item.BP, &recordedAt); err != nil {
-				watchRows.Close()
-				log.Printf("อ่านรายการสุขภาพจากนาฬิกาไม่สำเร็จ: %v", err)
-				return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
+		} else {
+			for watchRows.Next() {
+				var item HealthData
+				var recordedAt time.Time
+				if err := watchRows.Scan(&item.DeviceID, &item.BPM, &item.BP, &recordedAt); err != nil {
+					log.Printf("ข้ามรายการสุขภาพจากนาฬิกาที่อ่านไม่ได้: %v", err)
+					continue
+				}
+				item.Source = "watch"
+				item.Timestamp = recordedAt.UTC().Format(time.RFC3339Nano)
+				samples = append(samples, timedHealthSample{data: item, recordedAt: recordedAt})
 			}
-			item.Source = "watch"
-			item.Timestamp = recordedAt.UTC().Format(time.RFC3339Nano)
-			samples = append(samples, timedHealthSample{data: item, recordedAt: recordedAt})
-		}
-		if err := watchRows.Err(); err != nil {
+			if err := watchRows.Err(); err != nil {
+				log.Printf("อ่านประวัติสุขภาพจากนาฬิกาไม่ครบ: %v", err)
+			}
 			watchRows.Close()
-			log.Printf("อ่านประวัติสุขภาพจากนาฬิกาไม่สำเร็จ: %v", err)
-			return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
 		}
-		watchRows.Close()
 
 		manualRows, err := db.Query(
 			`SELECT id, note, recorded_at FROM care_record
