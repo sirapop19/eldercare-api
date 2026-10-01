@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,17 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถสร้างดัชนีข้อมูลสุขภาพ: %v", err)
 	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS manual_health_data (
+		id BIGSERIAL PRIMARY KEY,
+		elderly_id BIGINT NOT NULL,
+		bpm INTEGER NOT NULL,
+		spo2 INTEGER NOT NULL DEFAULT 0,
+		bp TEXT NOT NULL DEFAULT '',
+		record_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("ไม่สามารถเตรียมตารางบันทึกสุขภาพ: %v", err)
+	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watch_location (
 		id BIGSERIAL PRIMARY KEY,
 		device_id TEXT NOT NULL,
@@ -138,6 +150,8 @@ func initDB() {
 }
 
 type HealthData struct {
+	ID        int64   `json:"id,omitempty"`
+	Source    string  `json:"source,omitempty"`
 	DeviceID  string  `json:"device_id"`
 	BPM       int     `json:"bpm"`
 	SpO2      int     `json:"spo2"`
@@ -147,6 +161,50 @@ type HealthData struct {
 	Lat       float64 `json:"lat"`
 	Lng       float64 `json:"lng"`
 	Timestamp string  `json:"timestamp"`
+}
+
+type ManualHealthData struct {
+	BPM       int    `json:"bpm"`
+	BP        string `json:"bp"`
+	Timestamp string `json:"timestamp"`
+}
+
+func saveManualHealthData(c *fiber.Ctx, id int64) error {
+	var reading ManualHealthData
+	if err := c.BodyParser(&reading); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid health reading"})
+	}
+	if reading.BPM < 1 || reading.BPM > 300 {
+		return c.Status(400).JSON(fiber.Map{"error": "Health reading is out of range"})
+	}
+	if reading.Timestamp == "" {
+		reading.Timestamp = time.Now().Format(time.RFC3339)
+	}
+
+	var recordID int64
+	var timestamp string
+	var err error
+	if id == 0 {
+		err = db.QueryRow(
+			`INSERT INTO manual_health_data (elderly_id, bpm, bp, record_timestamp)
+			 VALUES ($1, $2, $3, $4) RETURNING id, record_timestamp::TEXT`,
+			1, reading.BPM, reading.BP, reading.Timestamp,
+		).Scan(&recordID, &timestamp)
+	} else {
+		err = db.QueryRow(
+			`UPDATE manual_health_data SET bpm = $1, bp = $2, record_timestamp = $3
+			 WHERE id = $4 AND elderly_id = $5 RETURNING id, record_timestamp::TEXT`,
+			reading.BPM, reading.BP, reading.Timestamp, id, 1,
+		).Scan(&recordID, &timestamp)
+	}
+	if err == sql.ErrNoRows {
+		return c.Status(404).JSON(fiber.Map{"error": "Health record not found"})
+	}
+	if err != nil {
+		log.Printf("ไม่สามารถบันทึกข้อมูลสุขภาพ: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save health reading"})
+	}
+	return c.JSON(fiber.Map{"id": recordID, "timestamp": timestamp, "source": "manual"})
 }
 
 type AlertData struct {
@@ -744,10 +802,20 @@ func main() {
 	app.Get("/api/health/history", func(c *fiber.Ctx) error {
 		deviceID := c.Query("device_id")
 		rows, err := db.Query(
-			`SELECT COALESCE(device_id, ''), heart_rate, record_timestamp::text 
-     		FROM health_data 
-     		WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2) 
-     		ORDER BY record_timestamp DESC LIMIT 720`,
+			`SELECT id, source, device_id, bpm, bp, timestamp
+			 FROM (
+				SELECT 0::BIGINT AS id, 'watch'::TEXT AS source,
+					COALESCE(device_id, '') AS device_id, heart_rate AS bpm,
+					COALESCE(blood_pressure, '') AS bp,
+					record_timestamp::TEXT AS timestamp
+				FROM health_data
+				WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2)
+				UNION ALL
+				SELECT id, 'manual'::TEXT AS source, '' AS device_id, bpm AS bpm, bp,
+					record_timestamp::TEXT AS timestamp
+				FROM manual_health_data WHERE elderly_id = $1
+			) AS health_history
+			ORDER BY timestamp DESC LIMIT 720`,
 			1, deviceID,
 		)
 		if err != nil {
@@ -758,14 +826,34 @@ func main() {
 		var history []HealthData
 		for rows.Next() {
 			var item HealthData
-			if err := rows.Scan(&item.DeviceID, &item.BPM, &item.Timestamp); err == nil {
-				history = append(history, item)
+			if err := rows.Scan(
+				&item.ID,
+				&item.Source,
+				&item.DeviceID,
+				&item.BPM,
+				&item.BP,
+				&item.Timestamp,
+			); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
 			}
+			history = append(history, item)
 		}
 		if history == nil {
 			history = []HealthData{}
 		}
 		return c.JSON(history)
+	})
+
+	app.Post("/api/health/manual", func(c *fiber.Ctx) error {
+		return saveManualHealthData(c, 0)
+	})
+
+	app.Put("/api/health/manual/:id", func(c *fiber.Ctx) error {
+		id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+		if err != nil || id <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid health record ID"})
+		}
+		return saveManualHealthData(c, id)
 	})
 
 	app.Post("/api/location", func(c *fiber.Ctx) error {
