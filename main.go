@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,17 +77,6 @@ func initDB() {
 	if err != nil {
 		log.Printf("ไม่สามารถสร้างดัชนีข้อมูลสุขภาพ: %v", err)
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS manual_health_data (
-		id BIGSERIAL PRIMARY KEY,
-		elderly_id BIGINT NOT NULL,
-		bpm INTEGER NOT NULL,
-		spo2 INTEGER NOT NULL DEFAULT 0,
-		bp TEXT NOT NULL DEFAULT '',
-		record_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Printf("ไม่สามารถเตรียมตารางบันทึกสุขภาพ: %v", err)
-	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watch_location (
 		id BIGSERIAL PRIMARY KEY,
 		device_id TEXT NOT NULL,
@@ -137,14 +128,32 @@ func initDB() {
 		log.Printf("ไม่สามารถเตรียมตารางการตั้งค่าอุปกรณ์: %v", err)
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS care_record (
+		id BIGSERIAL PRIMARY KEY,
 		caregiver_id BIGINT NOT NULL,
 		elderly_id BIGINT NOT NULL,
+		note TEXT NOT NULL DEFAULT '',
+		recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		start_date DATE,
-		work_shift TEXT NOT NULL DEFAULT '',
-		PRIMARY KEY (caregiver_id, elderly_id)
+		work_shift TEXT NOT NULL DEFAULT ''
 	)`)
 	if err != nil {
 		log.Printf("ไม่สามารถเตรียมตารางข้อมูลการดูแล: %v", err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE care_record ADD COLUMN IF NOT EXISTS id BIGSERIAL`,
+		`ALTER TABLE care_record ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE care_record ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+		`ALTER TABLE care_record ADD COLUMN IF NOT EXISTS start_date DATE`,
+		`ALTER TABLE care_record ADD COLUMN IF NOT EXISTS work_shift TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			log.Printf("ไม่สามารถปรับ schema ตาราง care_record: %v", err)
+		}
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS care_record_health_idx
+		ON care_record (elderly_id, recorded_at DESC)`)
+	if err != nil {
+		log.Printf("ไม่สามารถสร้างดัชนี care_record: %v", err)
 	}
 	log.Println("✅ เชื่อมต่อฐานข้อมูล PostgreSQL สำเร็จ!")
 }
@@ -169,6 +178,8 @@ type ManualHealthData struct {
 	Timestamp string `json:"timestamp"`
 }
 
+const manualHealthNotePrefix = "health-reading:"
+
 func saveManualHealthData(c *fiber.Ctx, id int64) error {
 	var reading ManualHealthData
 	if err := c.BodyParser(&reading); err != nil {
@@ -181,20 +192,25 @@ func saveManualHealthData(c *fiber.Ctx, id int64) error {
 		reading.Timestamp = time.Now().Format(time.RFC3339)
 	}
 
+	noteJSON, err := json.Marshal(reading)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid health reading"})
+	}
+	note := manualHealthNotePrefix + string(noteJSON)
 	var recordID int64
 	var timestamp string
-	var err error
 	if id == 0 {
 		err = db.QueryRow(
-			`INSERT INTO manual_health_data (elderly_id, bpm, bp, record_timestamp)
-			 VALUES ($1, $2, $3, $4) RETURNING id, record_timestamp::TEXT`,
-			1, reading.BPM, reading.BP, reading.Timestamp,
+			`INSERT INTO care_record (caregiver_id, elderly_id, note, recorded_at)
+			 VALUES ($1, $2, $3, $4) RETURNING id, recorded_at::TEXT`,
+			1, 1, note, reading.Timestamp,
 		).Scan(&recordID, &timestamp)
 	} else {
 		err = db.QueryRow(
-			`UPDATE manual_health_data SET bpm = $1, bp = $2, record_timestamp = $3
-			 WHERE id = $4 AND elderly_id = $5 RETURNING id, record_timestamp::TEXT`,
-			reading.BPM, reading.BP, reading.Timestamp, id, 1,
+			`UPDATE care_record SET note = $1, recorded_at = $2
+			 WHERE id = $3 AND elderly_id = $4 AND caregiver_id = $5
+			 AND note LIKE $6 RETURNING id, recorded_at::TEXT`,
+			note, reading.Timestamp, id, 1, 1, manualHealthNotePrefix+"%",
 		).Scan(&recordID, &timestamp)
 	}
 	if err == sql.ErrNoRows {
@@ -701,7 +717,8 @@ func main() {
 		var startDate sql.NullString
 		err := db.QueryRow(
 			`SELECT caregiver_id, elderly_id, start_date::text, work_shift
-				FROM care_record WHERE elderly_id = $1 ORDER BY caregiver_id LIMIT 1`,
+				FROM care_record WHERE elderly_id = $1 AND COALESCE(note, '') = ''
+				ORDER BY caregiver_id LIMIT 1`,
 			elderlyID,
 		).Scan(&record.CaregiverID, &record.ElderlyID, &startDate, &record.WorkShift)
 		if err == sql.ErrNoRows {
@@ -719,13 +736,22 @@ func main() {
 		if err := c.BodyParser(&record); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
-		_, err := db.Exec(`INSERT INTO care_record (caregiver_id, elderly_id, start_date, work_shift)
-			VALUES ($1, $2, NULLIF($3, '')::date, $4)
-			ON CONFLICT (caregiver_id, elderly_id) DO UPDATE SET
-				start_date = EXCLUDED.start_date,
-				work_shift = EXCLUDED.work_shift`,
-			record.CaregiverID, record.ElderlyID, record.StartDate, record.WorkShift,
+		result, err := db.Exec(`UPDATE care_record
+			SET start_date = NULLIF($1, '')::date, work_shift = $2
+			WHERE caregiver_id = $3 AND elderly_id = $4 AND COALESCE(note, '') = ''`,
+			record.StartDate, record.WorkShift, record.CaregiverID, record.ElderlyID,
 		)
+		if err == nil {
+			var affected int64
+			affected, err = result.RowsAffected()
+			if err == nil && affected == 0 {
+				_, err = db.Exec(`INSERT INTO care_record
+					(caregiver_id, elderly_id, note, start_date, work_shift)
+					VALUES ($1, $2, '', NULLIF($3, '')::date, $4)`,
+					record.CaregiverID, record.ElderlyID, record.StartDate, record.WorkShift,
+				)
+			}
+		}
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to save care record"})
 		}
@@ -784,7 +810,6 @@ func main() {
 					alertTitle = fmt.Sprintf("⚠️ ชีพจรต่ำผิดปกติ: %d BPM (ต่ำกว่าเกณฑ์ <%d)", newData.BPM, minBpm)
 				}
 
-				// ถ้าอยู่นอกเกณฑ์ ให้บันทึกแจ้งเตือนลงตาราง emergency_alert ทันที
 				if alertType != "" {
 					alertQuery := `INSERT INTO emergency_alert (elderly_id, device_id, alert_type, title, heart_rate, alert_timestamp)
 						VALUES ($1, $2, $3, $4, $5, $6)`
@@ -801,45 +826,88 @@ func main() {
 
 	app.Get("/api/health/history", func(c *fiber.Ctx) error {
 		deviceID := c.Query("device_id")
-		rows, err := db.Query(
-			`SELECT id, source, device_id, bpm, bp, timestamp
-			 FROM (
-				SELECT 0::BIGINT AS id, 'watch'::TEXT AS source,
-					COALESCE(device_id, '') AS device_id, heart_rate AS bpm,
-					COALESCE(blood_pressure, '') AS bp,
-					record_timestamp::TEXT AS timestamp
-				FROM health_data
-				WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2)
-				UNION ALL
-				SELECT id, 'manual'::TEXT AS source, '' AS device_id, bpm AS bpm, bp,
-					record_timestamp::TEXT AS timestamp
-				FROM manual_health_data WHERE elderly_id = $1
-			) AS health_history
-			ORDER BY timestamp DESC LIMIT 720`,
+		type timedHealthSample struct {
+			data       HealthData
+			recordedAt time.Time
+		}
+		samples := make([]timedHealthSample, 0)
+		watchRows, err := db.Query(
+			`SELECT COALESCE(device_id, ''), heart_rate,
+				COALESCE(blood_pressure, ''), record_timestamp
+			 FROM health_data
+			 WHERE elderly_id = $1 AND ($2 = '' OR device_id = $2)
+			 ORDER BY record_timestamp DESC LIMIT 720`,
 			1, deviceID,
 		)
 		if err != nil {
+			log.Printf("อ่านประวัติสุขภาพจากนาฬิกาไม่สำเร็จ: %v", err)
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
-		defer rows.Close()
-
-		var history []HealthData
-		for rows.Next() {
+		for watchRows.Next() {
 			var item HealthData
-			if err := rows.Scan(
-				&item.ID,
-				&item.Source,
-				&item.DeviceID,
-				&item.BPM,
-				&item.BP,
-				&item.Timestamp,
-			); err != nil {
+			var recordedAt time.Time
+			if err := watchRows.Scan(&item.DeviceID, &item.BPM, &item.BP, &recordedAt); err != nil {
+				watchRows.Close()
+				log.Printf("อ่านรายการสุขภาพจากนาฬิกาไม่สำเร็จ: %v", err)
 				return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
 			}
-			history = append(history, item)
+			item.Source = "watch"
+			item.Timestamp = recordedAt.UTC().Format(time.RFC3339Nano)
+			samples = append(samples, timedHealthSample{data: item, recordedAt: recordedAt})
 		}
-		if history == nil {
-			history = []HealthData{}
+		if err := watchRows.Err(); err != nil {
+			watchRows.Close()
+			log.Printf("อ่านประวัติสุขภาพจากนาฬิกาไม่สำเร็จ: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
+		}
+		watchRows.Close()
+
+		manualRows, err := db.Query(
+			`SELECT id, note, recorded_at FROM care_record
+			 WHERE elderly_id = $1 AND note LIKE $2
+			 ORDER BY recorded_at DESC LIMIT 720`,
+			1, manualHealthNotePrefix+"%",
+		)
+		if err != nil {
+			log.Printf("อ่านรายการสุขภาพที่ผู้ดูแลบันทึกไม่สำเร็จ: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+		}
+		for manualRows.Next() {
+			var item HealthData
+			var note string
+			var recordedAt time.Time
+			if err := manualRows.Scan(&item.ID, &note, &recordedAt); err != nil {
+				manualRows.Close()
+				log.Printf("อ่านรายการสุขภาพที่ผู้ดูแลบันทึกไม่สำเร็จ: %v", err)
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
+			}
+			var reading ManualHealthData
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(note, manualHealthNotePrefix)), &reading); err != nil {
+				log.Printf("ข้ามบันทึกสุขภาพที่มีรูปแบบไม่ถูกต้อง id=%d: %v", item.ID, err)
+				continue
+			}
+			item.Source = "manual"
+			item.BPM = reading.BPM
+			item.BP = reading.BP
+			item.Timestamp = recordedAt.UTC().Format(time.RFC3339Nano)
+			samples = append(samples, timedHealthSample{data: item, recordedAt: recordedAt})
+		}
+		if err := manualRows.Err(); err != nil {
+			manualRows.Close()
+			log.Printf("อ่านรายการสุขภาพที่ผู้ดูแลบันทึกไม่สำเร็จ: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to read health history"})
+		}
+		manualRows.Close()
+
+		sort.Slice(samples, func(left, right int) bool {
+			return samples[left].recordedAt.After(samples[right].recordedAt)
+		})
+		if len(samples) > 720 {
+			samples = samples[:720]
+		}
+		history := make([]HealthData, 0, len(samples))
+		for _, sample := range samples {
+			history = append(history, sample.data)
 		}
 		return c.JSON(history)
 	})
