@@ -674,7 +674,10 @@ func main() {
 			deviceID,
 		).Scan(&s.FallSensitivity, &s.CustomMinBpm, &s.CustomMaxBpm, &s.Status)
 
-		if err != nil && err != sql.ErrNoRows {
+		if err == sql.ErrNoRows {
+			return c.Status(404).JSON(fiber.Map{"error": "Watch device not found"})
+		}
+		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Database error"})
 		}
 		return c.JSON(s)
