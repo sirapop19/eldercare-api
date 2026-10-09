@@ -797,9 +797,8 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
 		}
 
-		if newData.Timestamp == "" {
-			newData.Timestamp = time.Now().Format("2006-01-02 15:04:05")
-		}
+		// Watch sends naive local time; use server UTC so clients convert correctly.
+		newData.Timestamp = time.Now().UTC().Format(time.RFC3339)
 
 		mutex.Lock()
 		currentData = newData
@@ -1007,9 +1006,8 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "device_id, type and title are required"})
 		}
 
-		if data.Timestamp == "" {
-			data.Timestamp = time.Now().Format("2006-01-02 15:04:05")
-		}
+		// Watch sends naive local time; use server UTC so clients convert correctly.
+		data.Timestamp = time.Now().UTC().Format(time.RFC3339)
 
 		query := `INSERT INTO emergency_alert (
 			elderly_id, device_id, alert_type, title, heart_rate, alert_timestamp
