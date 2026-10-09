@@ -333,7 +333,35 @@ var (
 	mutex               sync.Mutex
 	passwordResetTokens = make(map[string]passwordResetToken)
 	resetTokenMutex     sync.Mutex
+	offWristStates      = make(map[string]*offWristState)
+	offWristMutex       sync.Mutex
 )
+
+const offWristThreshold = 60 * time.Second
+
+type offWristState struct {
+	since    time.Time
+	notified bool
+}
+
+func shouldAlertWatchRemoved(deviceID string, bpm int) bool {
+	offWristMutex.Lock()
+	defer offWristMutex.Unlock()
+	if bpm > 0 {
+		delete(offWristStates, deviceID)
+		return false
+	}
+	state, ok := offWristStates[deviceID]
+	if !ok {
+		offWristStates[deviceID] = &offWristState{since: time.Now()}
+		return false
+	}
+	if state.notified || time.Since(state.since) < offWristThreshold {
+		return false
+	}
+	state.notified = true
+	return true
+}
 
 func createPasswordResetToken(email string) (string, error) {
 	bytes := make([]byte, 32)
@@ -814,6 +842,17 @@ func main() {
 						log.Printf("❌ สร้างแจ้งเตือนชีพจรผิดปกติไม่สำเร็จ: %v", alertErr)
 					}
 				}
+			}
+		}
+
+		if newData.DeviceID != "" && shouldAlertWatchRemoved(newData.DeviceID, newData.BPM) {
+			_, alertErr := db.Exec(
+				`INSERT INTO emergency_alert (elderly_id, device_id, alert_type, title, heart_rate, alert_timestamp)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				1, newData.DeviceID, "watch_removed", "นาฬิกาถูกถอดออกจากข้อมือ", 0, newData.Timestamp,
+			)
+			if alertErr != nil {
+				log.Printf("❌ สร้างแจ้งเตือนถอดนาฬิกาไม่สำเร็จ: %v", alertErr)
 			}
 		}
 
