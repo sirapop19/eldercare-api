@@ -849,7 +849,7 @@ func main() {
 			_, alertErr := db.Exec(
 				`INSERT INTO emergency_alert (elderly_id, device_id, alert_type, title, heart_rate, alert_timestamp)
 				VALUES ($1, $2, $3, $4, $5, $6)`,
-				1, newData.DeviceID, "watch_removed", "นาฬิกาถูกถอดออกจากข้อมือ", 0, newData.Timestamp,
+				1, newData.DeviceID, "watch_removed", "นาฬิกาถูกถอดออกจากข้อมือ", 0, time.Now().UTC().Format(time.RFC3339),
 			)
 			if alertErr != nil {
 				log.Printf("❌ สร้างแจ้งเตือนถอดนาฬิกาไม่สำเร็จ: %v", alertErr)
